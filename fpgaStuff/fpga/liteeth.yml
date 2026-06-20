@@ -1,0 +1,24 @@
+# PHY ----------------------------------------------------------------------
+phy:        LiteEthECP5PHYRGMII
+vendor:     lattice
+phy_tx_delay: 0e-9
+phy_rx_delay: 2e-9
+
+# Core ---------------------------------------------------------------------
+clk_freq:    125e6
+core:        udp
+mac_address: 0xAA040000CFCF
+ip_address:  192.168.178.50
+data_width:  8
+icmp: true
+
+# UDP Ports --------------------------------------------------------------------
+udp_ports:   {
+  "udp0": {
+    "with_broadcast": True,
+    "udp_port": 2000,
+    "data_width"    : 8,
+    "tx_fifo_depth" : 64,
+    "rx_fifo_depth" : 64,
+  },
+}
