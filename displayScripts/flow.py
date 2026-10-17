@@ -5,14 +5,14 @@ import cube
 from scipy.ndimage import gaussian_filter
 
 # Red tracers
-cIncr = [12, 10, 10]
-cDecr = [1, 2, 2]
-cLim =  [255, 200, 200]
+#cIncr = [12, 10, 10]
+#cDecr = [1, 2, 2]
+#cLim =  [255, 200, 200]
 
 # Green tracers
-#cIncr = [0, 12, 0]
-#cDecr = [5, 1, 5]
-#cLim =  [200, 255, 120]
+cIncr = [0, 12, 0]
+cDecr = [5, 1, 5]
+cLim =  [200, 255, 120]
 
 # Fireflies
 #cIncr = [40, 25, 40]
