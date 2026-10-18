@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Particle Life auf der Würfeloberfläche.
 
+
 Mehrere Partikelspezies ziehen sich gegenseitig an oder stoßen sich ab –
 festgelegt durch eine (asymmetrische) Kopplungsmatrix. Daraus entstehen
 Zellen, Ketten, Jäger-Beute-Schwärme und rotierende Strukturen. Die
