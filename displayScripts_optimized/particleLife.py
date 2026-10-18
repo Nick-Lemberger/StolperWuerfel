@@ -72,6 +72,10 @@ color_sharpness = 3.0           # >1: auf einem Pixel dominiert die stärkste Sp
 trail_fade = 0.55               # Nachleuchten pro Frame (0 = keins)
 halo = 0.15                     # weicher Schein um Partikel (0 = aus)
 particle_gain = 0.9             # Helligkeitsbeitrag eines Partikels
+# Helligkeit nach lokaler Dichte: einzelne Partikel gedimmt, Strukturen leuchten
+isolated_brightness = 0.12      # relative Helligkeit eines Partikels ohne Nachbarn (0..1)
+crowd_full = 4.0                # Anzahl Nachbarn für volle Helligkeit
+crowd_radius = 2                # Nachbarschaftsradius in Pixeln (1..4)
 brightness = 0.8                # 0..1, globale Helligkeit
 
 target_fps = 30                 # None = so schnell wie möglich
@@ -537,15 +541,35 @@ class Renderer:
         self.nb = np.stack([cl.PAD_IDX[:, 1 + dx:1 + dx + N, 1 + dy:1 + dy + N].ravel()
                             for dx, dy, _ in offs], axis=1)                # (Pixel, k)
         w = np.array([o[2] for o in offs]) * particle_gain
-        self.weights = np.tile(w, species.size)                            # (n * k)
+        self.w = w.astype(np.float64)                                      # (k,)
+        # Gewicht des Partikels selbst nach dem Nachbarschaftsfilter (zum Herausrechnen)
+        delta = np.zeros((cl.FACES, N, N)); delta[0, N // 2, N // 2] = 1.0
+        self.self_w = float(self._crowd_sum(delta)[0, N // 2, N // 2])
         self.sp_off = (species * self.size)[:, None]                       # Speziesblock
         self.glow = np.zeros((self.ns, self.size), dtype=np.float32)
         self.frame = np.zeros((cl.FACES, N, N, 3), dtype=np.uint8)
         self.fade = np.float32(trail_fade)
 
+    @staticmethod
+    def _crowd_sum(field):
+        """crowd_radius-fache 3x3-Summe über die Würfeloberfläche (Gewichte fallen nach außen ab)."""
+        for _ in range(max(1, int(crowd_radius))):
+            p = field.ravel()[cl.PAD_IDX]
+            field = (p[:, :-2, :-2] + p[:, :-2, 1:-1] + p[:, :-2, 2:] +
+                     p[:, 1:-1, :-2] + p[:, 1:-1, 1:-1] + p[:, 1:-1, 2:] +
+                     p[:, 2:, :-2] + p[:, 2:, 1:-1] + p[:, 2:, 2:])
+        return field
+
     def render(self, face, x, y):
         flat = (face * N + x.astype(np.intp)) * N + y.astype(np.intp)
         idx = (self.nb[flat] + self.sp_off).ravel()
+
+        # Lokale Dichte: Partikel pro Pixel, kantenübergreifend geglättet, am Partikelort
+        counts = np.bincount(flat, minlength=self.size).reshape(cl.FACES, N, N).astype(np.float64)
+        nbrs = (self._crowd_sum(counts).ravel()[flat] - self.self_w) / self.self_w
+        t = np.clip(nbrs / crowd_full, 0.0, 1.0)
+        pw = isolated_brightness + (1.0 - isolated_brightness) * t * t * (3 - 2 * t)
+        self.weights = (pw[:, None] * self.w[None, :]).ravel()
         self.glow *= self.fade
         self.glow.ravel()[:] += np.bincount(idx, weights=self.weights, minlength=self.ns * self.size)
 
