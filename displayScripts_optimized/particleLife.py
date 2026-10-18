@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Particle Life auf der Würfeloberfläche.
 
-
 Mehrere Partikelspezies ziehen sich gegenseitig an oder stoßen sich ab –
 festgelegt durch eine (asymmetrische) Kopplungsmatrix. Daraus entstehen
 Zellen, Ketten, Jäger-Beute-Schwärme und rotierende Strukturen. Die
@@ -16,22 +15,20 @@ Kraftgesetz (r = Abstand / r_max):
 Die Partikel werden für die Abstandsberechnung auf einen 3D-Würfel
 abgebildet, dadurch wirken Kräfte auch über Kanten und Ecken hinweg.
 """
+import importlib.util
 import json
 import os
 import platform
 import subprocess
 import sys
 
+# OpenMP-Threads zwischen den Frames schlafen lassen statt aktiv zu warten
+# (spart auf dem Pi CPU-Last und Wärme; muss vor dem Laden des C-Kerns gesetzt sein)
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 import numpy as np
 import cube
 import cubelib as cl
-
-try:                            # schneller, kompilierter Kraftkern (empfohlen)
-    import numba
-    from numba import njit, prange
-    HAVE_NUMBA = True
-except ImportError:             # Rückfall: NumPy + k-d-Baum (deutlich langsamer)
-    HAVE_NUMBA = False
 
 # ====================================================================== Einstellungen
 # ---------------------------------------------------------------- Partikel
@@ -77,11 +74,11 @@ target_fps = 30                 # None = so schnell wie möglich
 
 # ---------------------------------------------------------------- Rechenkern
 # "auto"     : beim ersten Start wird in einem Unterprozess getestet, welcher Kern auf
-#              diesem System stabil läuft (parallel -> seriell -> NumPy). Das Ergebnis
-#              wird in .particleLife_kernel.json gespeichert (löschen = neu testen).
-# "parallel" : Numba auf allen CPU-Kernen
-# "serial"   : Numba auf einem CPU-Kern
-# "numpy"    : ohne Numba (langsam)
+#              diesem System stabil läuft (C -> Numba parallel -> Numba seriell -> NumPy).
+#              Das Ergebnis steht in .particleLife_kernel.json (löschen = neu testen).
+# "c"        : kleiner C-Kern, einmalig mit gcc kompiliert, OpenMP auf allen CPU-Kernen
+# "parallel" : Numba auf allen CPU-Kernen       "serial": Numba auf einem CPU-Kern
+# "numpy"    : ohne Compiler (langsam)
 kernel_mode = "auto"
 
 UDP_IP = '192.168.178.50'
@@ -106,7 +103,7 @@ def to_3d(face, x, y):
 
 # ====================================================================== Kraftkern
 def _forces_numpy(P, species, K, r_max, beta, repel_force):
-    """Kräfte über k-d-Baum und vektorisierte Paarliste (ohne Numba)."""
+    """Kräfte über k-d-Baum und vektorisierte Paarliste (ohne Compiler, langsam)."""
     from scipy.spatial import cKDTree
     n = P.shape[0]
     pairs = cKDTree(P).query_pairs(r_max, output_type='ndarray')
@@ -131,12 +128,143 @@ def _forces_numpy(P, species, K, r_max, beta, repel_force):
     return np.bincount(idx, weights=vec.ravel(), minlength=3 * n).reshape(n, 3)
 
 
-KERNELS = {"numpy": _forces_numpy}
+# ---------------------------------------------------------------- C-Kern (gcc + OpenMP)
+_C_SRC = r"""
+#include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
-if HAVE_NUMBA:
+int pl_threads(void) {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+/* Kraft auf jedes Partikel, Zellenliste mit Zellgröße r_max.
+   P: n x 3 (Positionen), species: n, K: ns x ns (zeilenweise), F: n x 3 (Ausgabe) */
+int pl_forces(int64_t n, const double *P, const int64_t *species, int64_t ns,
+              const double *K, double r_max, double beta, double repel, double *F)
+{
+    const int64_t nc = (int64_t)(64.0 / r_max) + 1;
+    const int64_t ncell = nc * nc * nc;
+    int64_t *head = (int64_t *)malloc(sizeof(int64_t) * ncell);
+    int64_t *nxt  = (int64_t *)malloc(sizeof(int64_t) * (n > 0 ? n : 1));
+    int64_t *cell = (int64_t *)malloc(sizeof(int64_t) * 3 * (n > 0 ? n : 1));
+    if (!head || !nxt || !cell) { free(head); free(nxt); free(cell); return -1; }
+
+    for (int64_t c = 0; c < ncell; c++) head[c] = -1;
+    for (int64_t i = 0; i < n; i++) {
+        for (int k = 0; k < 3; k++) {
+            double v = P[3 * i + k] / r_max;
+            if (!(v >= 0.0)) v = 0.0;                 /* auch NaN abfangen */
+            if (v > (double)(nc - 1)) v = (double)(nc - 1);
+            cell[3 * i + k] = (int64_t)v;
+        }
+        int64_t ci = (cell[3 * i] * nc + cell[3 * i + 1]) * nc + cell[3 * i + 2];
+        nxt[i] = head[ci];
+        head[ci] = i;
+    }
+
+    const double r2max = r_max * r_max;
+    const double inv_1mb = 1.0 / (1.0 - beta);
+
+    #pragma omp parallel for schedule(dynamic, 32)
+    for (int64_t i = 0; i < n; i++) {
+        const int64_t si = species[i];
+        const double px = P[3 * i], py = P[3 * i + 1], pz = P[3 * i + 2];
+        const int64_t cx = cell[3 * i], cy = cell[3 * i + 1], cz = cell[3 * i + 2];
+        double fx = 0.0, fy = 0.0, fz = 0.0;
+        for (int64_t ax = (cx > 0 ? cx - 1 : 0); ax <= (cx + 1 < nc ? cx + 1 : nc - 1); ax++)
+        for (int64_t ay = (cy > 0 ? cy - 1 : 0); ay <= (cy + 1 < nc ? cy + 1 : nc - 1); ay++)
+        for (int64_t az = (cz > 0 ? cz - 1 : 0); az <= (cz + 1 < nc ? cz + 1 : nc - 1); az++) {
+            for (int64_t j = head[(ax * nc + ay) * nc + az]; j != -1; j = nxt[j]) {
+                if (j == i) continue;
+                const double dx = P[3 * j] - px, dy = P[3 * j + 1] - py, dz = P[3 * j + 2] - pz;
+                const double d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 >= r2max) continue;
+                double dist = sqrt(d2);
+                if (dist < 1e-6) dist = 1e-6;
+                const double r = dist / r_max;
+                double f;
+                if (r < beta) f = repel * (r / beta - 1.0);
+                else          f = K[si * ns + species[j]] * (1.0 - fabs(2.0 * r - 1.0 - beta) * inv_1mb);
+                f /= dist;
+                fx += f * dx; fy += f * dy; fz += f * dz;
+            }
+        }
+        F[3 * i] = fx; F[3 * i + 1] = fy; F[3 * i + 2] = fz;
+    }
+    free(head); free(nxt); free(cell);
+    return 0;
+}
+"""
+
+C_THREADS = None
+
+
+def _load_c_kernel():
+    """Kompiliert den C-Kern einmalig (Ergebnis in __pycache__/) und lädt ihn per ctypes."""
+    global C_THREADS
+    import ctypes
+    import hashlib
+    import shutil
+    cc = shutil.which("cc") or shutil.which("gcc")
+    build_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "__pycache__")
+    tag = hashlib.sha1((_C_SRC + platform.machine()).encode()).hexdigest()[:12]
+    so = os.path.join(build_dir, f"particleLife_kernel_{tag}.so")
+    if not os.path.exists(so):
+        if cc is None:
+            raise RuntimeError("kein C-Compiler gefunden – 'sudo apt install gcc'")
+        os.makedirs(build_dir, exist_ok=True)
+        src = so[:-3] + ".c"
+        with open(src, "w") as fh:
+            fh.write(_C_SRC)
+        tmp = f"{so}.{os.getpid()}.tmp"
+        err = ""
+        for flags in (["-O3", "-march=native", "-fopenmp"], ["-O3", "-fopenmp"], ["-O3"]):
+            res = subprocess.run([cc, *flags, "-shared", "-fPIC", "-o", tmp, src, "-lm"],
+                                 capture_output=True, text=True)
+            if res.returncode == 0:
+                os.replace(tmp, so)
+                break
+            err = res.stderr
+        else:
+            raise RuntimeError("C-Kern ließ sich nicht kompilieren:\n" + err)
+
+    lib = ctypes.CDLL(so)
+    dptr = np.ctypeslib.ndpointer(np.float64, flags="C_CONTIGUOUS")
+    iptr = np.ctypeslib.ndpointer(np.int64, flags="C_CONTIGUOUS")
+    fn = lib.pl_forces
+    fn.argtypes = [ctypes.c_int64, dptr, iptr, ctypes.c_int64, dptr,
+                   ctypes.c_double, ctypes.c_double, ctypes.c_double, dptr]
+    fn.restype = ctypes.c_int
+    lib.pl_threads.restype = ctypes.c_int
+    C_THREADS = lib.pl_threads()
+
+    def forces_c(P, species, K, r_max, beta, repel_force):
+        P = np.ascontiguousarray(P, dtype=np.float64)
+        species = np.ascontiguousarray(species, dtype=np.int64)
+        K = np.ascontiguousarray(K, dtype=np.float64)
+        F = np.empty_like(P)
+        if fn(P.shape[0], P, species, K.shape[0], K, r_max, beta, repel_force, F) != 0:
+            raise MemoryError("C-Kern: Speicher konnte nicht reserviert werden")
+        return F
+
+    return forces_c
+
+
+# ---------------------------------------------------------------- Numba-Kerne (optional)
+def _load_numba_kernels():
+    """Numba wird nur importiert, wenn ein Numba-Kern gewählt ist."""
+    from numba import njit, prange
+
     @njit(cache=True)
     def _build_cells(P, r_max):
-        """Zellenliste (Zellgröße = r_max) als verkettete Liste head/nxt."""
         n = P.shape[0]
         nc = int(64.0 / r_max) + 1
         head = np.full(nc * nc * nc, -1, dtype=np.int64)
@@ -153,8 +281,6 @@ if HAVE_NUMBA:
 
     @njit(cache=True)
     def _force_on(i, P, species, K, r_max, beta, repel_force, head, nxt, cell, nc):
-        """Kraft auf Partikel i. Eigene Funktion, damit in der (parallelen) Hauptschleife
-        keine verschachtelten Schleifen stehen – die lösen in Numba 0.56 Segfaults aus."""
         r2max = r_max * r_max
         inv_1mb = 1.0 / (1.0 - beta)
         si = species[i]
@@ -209,66 +335,83 @@ if HAVE_NUMBA:
             F[i, 2] = fz
         return F
 
-    KERNELS["serial"] = _forces_serial
-    KERNELS["parallel"] = _forces_parallel
+    return {"parallel": _forces_parallel, "serial": _forces_serial}
 
-KERNEL_LABEL = {"parallel": "Numba, parallel", "serial": "Numba, seriell",
+
+# ---------------------------------------------------------------- Auswahl
+KERNEL_LABEL = {"c": "C/OpenMP", "parallel": "Numba, parallel", "serial": "Numba, seriell",
                 "numpy": "NumPy (langsam)"}
 KERNEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".particleLife_kernel.json")
 compute_forces = _forces_numpy        # wird in main() durch den gewählten Kern ersetzt
 
 
+def get_kernel(mode):
+    if mode == "c":
+        return _load_c_kernel()
+    if mode in ("parallel", "serial"):
+        return _load_numba_kernels()[mode]
+    return _forces_numpy
+
+
+def _numba_version():
+    if importlib.util.find_spec("numba") is None:
+        return None
+    try:
+        from importlib.metadata import version
+        return version("numba")
+    except Exception:
+        return "?"
+
+
 def _system_key():
     """Kennung von System und Problemgröße – ändert sich etwas davon, wird neu getestet."""
-    return (f"numba {numba.__version__}, python {platform.python_version()}, "
-            f"{platform.machine()}, n={n_particles}, r_max={r_max}")
+    return (f"v2, python {platform.python_version()}, {platform.machine()}, "
+            f"numba {_numba_version()}, n={n_particles}, r_max={r_max}")
 
 
 def _kernel_selftest(mode):
     """Läuft im Unterprozess: echte Simulationsschritte mit `mode`, Ergebnis gegen NumPy prüfen."""
     global compute_forces
-    compute_forces = KERNELS[mode]
+    compute_forces = get_kernel(mode)
     parts = Particles()
     coupling = Coupling(n_species, verbose=False)
     for _ in range(100):
         parts.step(coupling.step())
     P = to_3d(parts.face, parts.x, parts.y)
     args = (P, parts.species, np.ascontiguousarray(coupling.K), float(r_max), float(beta), float(repel_force))
-    return np.allclose(KERNELS[mode](*args), _forces_numpy(*args), rtol=1e-6, atol=1e-9)
+    return np.allclose(compute_forces(*args), _forces_numpy(*args), rtol=1e-6, atol=1e-9)
 
 
 def choose_kernel():
-    if not HAVE_NUMBA or kernel_mode == "numpy":
-        if kernel_mode != "numpy":
-            print("Numba nicht gefunden – 'sudo apt install python3-numba' empfohlen.")
-        return "numpy"
-    if kernel_mode in ("parallel", "serial"):
+    if kernel_mode in KERNEL_LABEL and kernel_mode != "auto":
         return kernel_mode
 
     key = _system_key()
     try:
         with open(KERNEL_FILE) as fh:
             saved = json.load(fh)
-        if saved.get("key") == key and saved.get("mode") in KERNELS:
+        if saved.get("key") == key and saved.get("mode") in KERNEL_LABEL:
             return saved["mode"]
     except (OSError, ValueError):
         pass
 
+    candidates = ["c"] + (["parallel", "serial"] if _numba_version() else [])
     chosen = "numpy"
-    for mode in ("parallel", "serial"):
-        print(f"Teste Kern '{KERNEL_LABEL[mode]}' (einmalig, auf dem Pi bis zu 1–2 min) ...", flush=True)
+    for mode in candidates:
+        print(f"Teste Kern '{KERNEL_LABEL[mode]}' (einmalig) ...", flush=True)
         try:
             res = subprocess.run([sys.executable, os.path.abspath(__file__), "--kernel-test", mode],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=900)
             code = res.returncode
+            last = (res.stderr.strip().splitlines() or [""])[-1]
         except subprocess.TimeoutExpired:
-            code = "Timeout"
+            code, last = "Timeout", ""
         if code == 0:
             print("  -> ok")
             chosen = mode
             break
         reason = "Segfault" if code == -11 else f"Rückgabewert {code}"
-        print(f"  -> fehlgeschlagen ({reason})")
+        print(f"  -> fehlgeschlagen ({reason}){': ' + last if last else ''}")
     try:
         with open(KERNEL_FILE, "w") as fh:
             json.dump({"key": key, "mode": chosen}, fh)
@@ -403,8 +546,9 @@ class Renderer:
 def main():
     global compute_forces
     mode = choose_kernel()
-    compute_forces = KERNELS[mode]
-    print("Kraftkern:", KERNEL_LABEL[mode])
+    compute_forces = get_kernel(mode)
+    extra = f", {C_THREADS} Threads" if mode == "c" else ""
+    print(f"Kraftkern: {KERNEL_LABEL[mode]}{extra}")
 
     c = cube.Cube(UDP_IP, UDP_PORT)
     limiter = cl.FrameLimiter(target_fps)
