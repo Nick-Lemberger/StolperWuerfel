@@ -28,8 +28,8 @@ except ImportError:             # Rückfall: NumPy + k-d-Baum (deutlich langsame
 
 # ====================================================================== Einstellungen
 # ---------------------------------------------------------------- Partikel
-n_species = 6                   # Anzahl Spezies (1 .. len(species_colors) bzw. beliebig)
-n_particles = 1600              # Gesamtzahl Partikel
+n_species = 3                   # Anzahl Spezies (1 .. len(species_colors) bzw. beliebig)
+n_particles = 900              # Gesamtzahl Partikel
 species_counts = None           # optional Liste je Spezies, z. B. [400, 300, 300, 200, 200, 100]
 
 # ---------------------------------------------------------------- Physik
