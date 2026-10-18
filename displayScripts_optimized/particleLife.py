@@ -15,21 +15,27 @@ Kraftgesetz (r = Abstand / r_max):
 Die Partikel werden für die Abstandsberechnung auf einen 3D-Würfel
 abgebildet, dadurch wirken Kräfte auch über Kanten und Ecken hinweg.
 """
+import json
+import os
+import platform
+import subprocess
+import sys
+
 import numpy as np
 import cube
 import cubelib as cl
 
 try:                            # schneller, kompilierter Kraftkern (empfohlen)
+    import numba
     from numba import njit, prange
     HAVE_NUMBA = True
 except ImportError:             # Rückfall: NumPy + k-d-Baum (deutlich langsamer)
-    from scipy.spatial import cKDTree
     HAVE_NUMBA = False
 
 # ====================================================================== Einstellungen
 # ---------------------------------------------------------------- Partikel
-n_species = 3                   # Anzahl Spezies (1 .. len(species_colors) bzw. beliebig)
-n_particles = 900              # Gesamtzahl Partikel
+n_species = 6                   # Anzahl Spezies (1 .. len(species_colors) bzw. beliebig)
+n_particles = 1600              # Gesamtzahl Partikel
 species_counts = None           # optional Liste je Spezies, z. B. [400, 300, 300, 200, 200, 100]
 
 # ---------------------------------------------------------------- Physik
@@ -44,9 +50,9 @@ max_speed = 1.5                 # Pixel pro Frame (Stabilitätsgrenze)
 # K[a, b]: wie stark Spezies a von Spezies b angezogen (+) bzw. abgestoßen (-) wird.
 # None = zufällig, sonst Liste von Listen (n_species x n_species) mit Werten -1..1.
 coupling_matrix = None
-matrix_period = 100             # alle n Frames ein neues Ziel für die Matrix
-matrix_blend = 10              # Überblenddauer zum neuen Ziel (Frames)
-matrix_change_fraction = 5*0.4    # Anteil der Einträge, die sich pro Wechsel ändern
+matrix_period = 700             # alle n Frames ein neues Ziel für die Matrix
+matrix_blend = 300              # Überblenddauer zum neuen Ziel (Frames)
+matrix_change_fraction = 0.4    # Anteil der Einträge, die sich pro Wechsel ändern
 matrix_drift = 0.002            # zusätzliches leichtes Zufallsrauschen pro Frame
 
 # ---------------------------------------------------------------- Farben
@@ -67,6 +73,15 @@ particle_gain = 0.9             # Helligkeitsbeitrag eines Partikels
 brightness = 0.8                # 0..1, globale Helligkeit
 
 target_fps = 30                 # None = so schnell wie möglich
+
+# ---------------------------------------------------------------- Rechenkern
+# "auto"     : beim ersten Start wird in einem Unterprozess getestet, welcher Kern auf
+#              diesem System stabil läuft (parallel -> seriell -> NumPy). Das Ergebnis
+#              wird in .particleLife_kernel.json gespeichert (löschen = neu testen).
+# "parallel" : Numba auf allen CPU-Kernen
+# "serial"   : Numba auf einem CPU-Kern
+# "numpy"    : ohne Numba (langsam)
+kernel_mode = "auto"
 
 UDP_IP = '192.168.178.50'
 UDP_PORT = 2000
@@ -91,6 +106,7 @@ def to_3d(face, x, y):
 # ====================================================================== Kraftkern
 def _forces_numpy(P, species, K, r_max, beta, repel_force):
     """Kräfte über k-d-Baum und vektorisierte Paarliste (ohne Numba)."""
+    from scipy.spatial import cKDTree
     n = P.shape[0]
     pairs = cKDTree(P).query_pairs(r_max, output_type='ndarray')
     if pairs.size == 0:
@@ -114,13 +130,15 @@ def _forces_numpy(P, species, K, r_max, beta, repel_force):
     return np.bincount(idx, weights=vec.ravel(), minlength=3 * n).reshape(n, 3)
 
 
+KERNELS = {"numpy": _forces_numpy}
+
 if HAVE_NUMBA:
-    @njit(cache=True, fastmath=True, parallel=True)
-    def _forces_numba(P, species, K, r_max, beta, repel_force):
-        """Kräfte mit Zellenliste (Zellgröße = r_max) – O(N * Nachbarn), auf alle Kerne verteilt."""
+    @njit(cache=True)
+    def _build_cells(P, r_max):
+        """Zellenliste (Zellgröße = r_max) als verkettete Liste head/nxt."""
         n = P.shape[0]
         nc = int(64.0 / r_max) + 1
-        head = -np.ones(nc * nc * nc, dtype=np.int64)
+        head = np.full(nc * nc * nc, -1, dtype=np.int64)
         nxt = np.empty(n, dtype=np.int64)
         cell = np.empty((n, 3), dtype=np.int64)
         for i in range(n):
@@ -130,53 +148,141 @@ if HAVE_NUMBA:
             ci = (cell[i, 0] * nc + cell[i, 1]) * nc + cell[i, 2]
             nxt[i] = head[ci]
             head[ci] = i
+        return head, nxt, cell, nc
 
-        F = np.zeros((n, 3))
+    @njit(cache=True)
+    def _force_on(i, P, species, K, r_max, beta, repel_force, head, nxt, cell, nc):
+        """Kraft auf Partikel i. Eigene Funktion, damit in der (parallelen) Hauptschleife
+        keine verschachtelten Schleifen stehen – die lösen in Numba 0.56 Segfaults aus."""
         r2max = r_max * r_max
         inv_1mb = 1.0 / (1.0 - beta)
-        for i in prange(n):
-            si = species[i]
-            fx = 0.0
-            fy = 0.0
-            fz = 0.0
-            for ax in range(max(cell[i, 0] - 1, 0), min(cell[i, 0] + 2, nc)):
-                for ay in range(max(cell[i, 1] - 1, 0), min(cell[i, 1] + 2, nc)):
-                    for az in range(max(cell[i, 2] - 1, 0), min(cell[i, 2] + 2, nc)):
-                        j = head[(ax * nc + ay) * nc + az]
-                        while j != -1:
-                            if j != i:
-                                dx = P[j, 0] - P[i, 0]
-                                dy = P[j, 1] - P[i, 1]
-                                dz = P[j, 2] - P[i, 2]
-                                d2 = dx * dx + dy * dy + dz * dz
-                                if d2 < r2max:
-                                    dist = max(np.sqrt(d2), 1e-6)
-                                    r = dist / r_max
-                                    if r < beta:
-                                        f = repel_force * (r / beta - 1.0)
-                                    else:
-                                        f = K[si, species[j]] * (1.0 - abs(2.0 * r - 1.0 - beta) * inv_1mb)
-                                    f /= dist
-                                    fx += f * dx
-                                    fy += f * dy
-                                    fz += f * dz
-                            j = nxt[j]
+        si = species[i]
+        fx = 0.0
+        fy = 0.0
+        fz = 0.0
+        for ax in range(max(cell[i, 0] - 1, 0), min(cell[i, 0] + 2, nc)):
+            for ay in range(max(cell[i, 1] - 1, 0), min(cell[i, 1] + 2, nc)):
+                for az in range(max(cell[i, 2] - 1, 0), min(cell[i, 2] + 2, nc)):
+                    j = head[(ax * nc + ay) * nc + az]
+                    while j != -1:
+                        if j != i:
+                            dx = P[j, 0] - P[i, 0]
+                            dy = P[j, 1] - P[i, 1]
+                            dz = P[j, 2] - P[i, 2]
+                            d2 = dx * dx + dy * dy + dz * dz
+                            if d2 < r2max:
+                                dist = max(np.sqrt(d2), 1e-6)
+                                r = dist / r_max
+                                if r < beta:
+                                    f = repel_force * (r / beta - 1.0)
+                                else:
+                                    f = K[si, species[j]] * (1.0 - abs(2.0 * r - 1.0 - beta) * inv_1mb)
+                                f /= dist
+                                fx += f * dx
+                                fy += f * dy
+                                fz += f * dz
+                        j = nxt[j]
+        return fx, fy, fz
+
+    @njit(cache=True)
+    def _forces_serial(P, species, K, r_max, beta, repel_force):
+        head, nxt, cell, nc = _build_cells(P, r_max)
+        n = P.shape[0]
+        F = np.empty((n, 3))
+        for i in range(n):
+            fx, fy, fz = _force_on(i, P, species, K, r_max, beta, repel_force, head, nxt, cell, nc)
             F[i, 0] = fx
             F[i, 1] = fy
             F[i, 2] = fz
         return F
 
-    compute_forces = _forces_numba
-else:
-    compute_forces = _forces_numpy
+    @njit(cache=True, parallel=True)
+    def _forces_parallel(P, species, K, r_max, beta, repel_force):
+        head, nxt, cell, nc = _build_cells(P, r_max)
+        n = P.shape[0]
+        F = np.empty((n, 3))
+        for i in prange(n):
+            fx, fy, fz = _force_on(i, P, species, K, r_max, beta, repel_force, head, nxt, cell, nc)
+            F[i, 0] = fx
+            F[i, 1] = fy
+            F[i, 2] = fz
+        return F
+
+    KERNELS["serial"] = _forces_serial
+    KERNELS["parallel"] = _forces_parallel
+
+KERNEL_LABEL = {"parallel": "Numba, parallel", "serial": "Numba, seriell",
+                "numpy": "NumPy (langsam)"}
+KERNEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".particleLife_kernel.json")
+compute_forces = _forces_numpy        # wird in main() durch den gewählten Kern ersetzt
+
+
+def _system_key():
+    """Kennung von System und Problemgröße – ändert sich etwas davon, wird neu getestet."""
+    return (f"numba {numba.__version__}, python {platform.python_version()}, "
+            f"{platform.machine()}, n={n_particles}, r_max={r_max}")
+
+
+def _kernel_selftest(mode):
+    """Läuft im Unterprozess: echte Simulationsschritte mit `mode`, Ergebnis gegen NumPy prüfen."""
+    global compute_forces
+    compute_forces = KERNELS[mode]
+    parts = Particles()
+    coupling = Coupling(n_species, verbose=False)
+    for _ in range(100):
+        parts.step(coupling.step())
+    P = to_3d(parts.face, parts.x, parts.y)
+    args = (P, parts.species, np.ascontiguousarray(coupling.K), float(r_max), float(beta), float(repel_force))
+    return np.allclose(KERNELS[mode](*args), _forces_numpy(*args), rtol=1e-6, atol=1e-9)
+
+
+def choose_kernel():
+    if not HAVE_NUMBA or kernel_mode == "numpy":
+        if kernel_mode != "numpy":
+            print("Numba nicht gefunden – 'sudo apt install python3-numba' empfohlen.")
+        return "numpy"
+    if kernel_mode in ("parallel", "serial"):
+        return kernel_mode
+
+    key = _system_key()
+    try:
+        with open(KERNEL_FILE) as fh:
+            saved = json.load(fh)
+        if saved.get("key") == key and saved.get("mode") in KERNELS:
+            return saved["mode"]
+    except (OSError, ValueError):
+        pass
+
+    chosen = "numpy"
+    for mode in ("parallel", "serial"):
+        print(f"Teste Kern '{KERNEL_LABEL[mode]}' (einmalig, auf dem Pi bis zu 1–2 min) ...", flush=True)
+        try:
+            res = subprocess.run([sys.executable, os.path.abspath(__file__), "--kernel-test", mode],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
+            code = res.returncode
+        except subprocess.TimeoutExpired:
+            code = "Timeout"
+        if code == 0:
+            print("  -> ok")
+            chosen = mode
+            break
+        reason = "Segfault" if code == -11 else f"Rückgabewert {code}"
+        print(f"  -> fehlgeschlagen ({reason})")
+    try:
+        with open(KERNEL_FILE, "w") as fh:
+            json.dump({"key": key, "mode": chosen}, fh)
+    except OSError:
+        pass
+    return chosen
 
 
 # ====================================================================== Kopplungsmatrix
 class Coupling:
     """Kopplungsmatrix, die in Abständen weich zu einem teilweise neuen Zufallsziel überblendet."""
 
-    def __init__(self, n):
+    def __init__(self, n, verbose=True):
         self.n = n
+        self.verbose = verbose
         if coupling_matrix is not None:
             self.K = np.array(coupling_matrix, dtype=float)
             assert self.K.shape == (n, n), "coupling_matrix muss n_species x n_species sein"
@@ -188,6 +294,8 @@ class Coupling:
         self._print("Start")
 
     def _print(self, title):
+        if not self.verbose:
+            return
         print(f"Kopplungsmatrix ({title}):")
         print(np.array2string(self.K if title == "Start" else self.target,
                               precision=2, suppress_small=True))
@@ -292,9 +400,13 @@ class Renderer:
 
 # ====================================================================== Hauptschleife
 def main():
+    global compute_forces
+    mode = choose_kernel()
+    compute_forces = KERNELS[mode]
+    print("Kraftkern:", KERNEL_LABEL[mode])
+
     c = cube.Cube(UDP_IP, UDP_PORT)
     limiter = cl.FrameLimiter(target_fps)
-    print("Kraftkern:", "Numba" if HAVE_NUMBA else "NumPy (langsam – 'sudo apt install python3-numba' empfohlen)")
     coupling = Coupling(n_species)
     parts = Particles()
     renderer = Renderer(parts.species)
@@ -307,4 +419,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--kernel-test":
+        sys.exit(0 if _kernel_selftest(sys.argv[2]) else 1)
     main()
