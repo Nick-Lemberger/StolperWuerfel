@@ -55,16 +55,20 @@ matrix_drift = 0.002            # zusätzliches leichtes Zufallsrauschen pro Fra
 
 # ---------------------------------------------------------------- Farben
 # Farbmatrix: eine RGB-Zeile pro Spezies. Bei mehr Spezies werden Farben ergänzt.
+# Gesättigte LED-Farben: höchstens 2 Kanäle > 50, Reihenfolge = maximaler Abstand
+# für die ersten n Spezies. Bei mehr Spezies werden reine Farbtöne ergänzt.
 species_colors = [
-    (255, 95, 80),     # Koralle
-    (255, 185, 40),    # Bernstein
-    (140, 230, 70),    # Limette
-    (30, 210, 175),    # Türkis
-    (60, 140, 255),    # Himmelblau
-    (165, 95, 255),    # Violett
-    (245, 70, 185),    # Magenta
-    (240, 235, 215),   # Elfenbein
+    (255, 0, 0),       # Rot
+    (0, 255, 0),       # Grün
+    (0, 40, 255),      # Blau
+    (255, 190, 0),     # Gelb
+    (0, 230, 255),     # Cyan
+    (255, 0, 200),     # Magenta
+    (255, 70, 0),      # Orange
+    (130, 0, 255),     # Violett
 ]
+color_sharpness = 3.0           # >1: auf einem Pixel dominiert die stärkste Spezies
+                                #     statt Farben additiv zu mischen (verhindert Weiß)
 trail_fade = 0.55               # Nachleuchten pro Frame (0 = keins)
 halo = 0.15                     # weicher Schein um Partikel (0 = aus)
 particle_gain = 0.9             # Helligkeitsbeitrag eines Partikels
@@ -506,19 +510,25 @@ class Particles:
 
 # ====================================================================== Darstellung
 def color_table(n):
-    """Farbmatrix (n, 3) in 0..1; fehlende Farben werden gleichmäßig im Farbkreis ergänzt."""
+    """Farbmatrix (n, 3) in 0..1. Fehlende Farben: reine Farbtöne (ein Kanal = 0)."""
     cols = [np.array(c, dtype=float) / 255.0 for c in species_colors[:n]]
     for k in range(len(cols), n):
-        h = (k * 0.618034) % 1.0
-        rgb = np.clip(np.abs((h * 6 + np.array([0, 4, 2])) % 6 - 3) - 1, 0, 1)
-        cols.append(0.25 + 0.75 * rgb)
+        h = (k * 0.618034 + 0.05) % 1.0
+        cols.append(np.clip(np.abs((h * 6 + np.array([0, 4, 2])) % 6 - 3) - 1, 0, 1))
     return np.array(cols)
 
 
 class Renderer:
+    """Nachleuchten getrennt je Spezies. Pro Pixel bestimmt die dominierende Spezies den
+    Farbton, die Gesamtmenge nur die Helligkeit. So bleiben Farben gesättigt und
+    unterscheidbar; zusätzlich haben nie mehr als 2 Kanäle einen Wert > 50."""
+
+    MAX_THIRD = 50                  # Obergrenze für den schwächsten Kanal
+
     def __init__(self, species):
         self.size = cl.FACES * N * N
-        col = color_table(n_species)[species] * particle_gain           # (n, 3)
+        self.ns = n_species
+        self.cols = color_table(n_species).T.astype(np.float32)             # (3, ns)
         # Pixel selbst + 8 Nachbarpixel (kantenübergreifend) mit Halo-Gewichten
         offs = [(0, 0, 1.0)]
         if halo:
@@ -526,19 +536,39 @@ class Renderer:
                      for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
         self.nb = np.stack([cl.PAD_IDX[:, 1 + dx:1 + dx + N, 1 + dy:1 + dy + N].ravel()
                             for dx, dy, _ in offs], axis=1)                # (Pixel, k)
-        w = np.array([o[2] for o in offs])
-        self.weights = (col[:, None, :] * w[None, :, None])               # (n, k, 3)
-        self.chan = np.arange(3) * self.size
-        self.glow = np.zeros(3 * self.size)
+        w = np.array([o[2] for o in offs]) * particle_gain
+        self.weights = np.tile(w, species.size)                            # (n * k)
+        self.sp_off = (species * self.size)[:, None]                       # Speziesblock
+        self.glow = np.zeros((self.ns, self.size), dtype=np.float32)
         self.frame = np.zeros((cl.FACES, N, N, 3), dtype=np.uint8)
+        self.fade = np.float32(trail_fade)
 
     def render(self, face, x, y):
         flat = (face * N + x.astype(np.intp)) * N + y.astype(np.intp)
-        idx = (self.nb[flat][:, :, None] + self.chan).ravel()             # (n, k, 3)
-        self.glow *= trail_fade
-        self.glow += np.bincount(idx, weights=self.weights.ravel(), minlength=3 * self.size)
-        out = 1.0 - np.exp(-1.5 * self.glow)
-        self.frame[:] = out.reshape(3, cl.FACES, N, N).transpose(1, 2, 3, 0) * (255 * brightness)
+        idx = (self.nb[flat] + self.sp_off).ravel()
+        self.glow *= self.fade
+        self.glow.ravel()[:] += np.bincount(idx, weights=self.weights, minlength=self.ns * self.size)
+
+        total = self.glow.sum(axis=0)
+        act = np.nonzero(total > 2e-3)[0]                 # nur Pixel, die sichtbar leuchten
+        out = np.zeros((3, act.size), dtype=np.float32)
+        if act.size:
+            G = self.glow[:, act]
+            Gs = G * G * G if color_sharpness == 3.0 else G ** np.float32(color_sharpness)
+            hue = (self.cols @ Gs) / np.maximum(Gs.sum(axis=0), np.float32(1e-20))   # (3, aktiv)
+            level = np.float32(1.0) - np.exp(np.float32(-1.5) * total[act])          # Helligkeit
+            out = hue * (level * np.float32(255 * brightness))
+
+            # Harte Grenze: höchstens 2 Kanäle über MAX_THIRD
+            k = out.argmin(axis=0)
+            cols = np.arange(act.size)
+            third = out[k, cols]
+            over = third > self.MAX_THIRD
+            if over.any():
+                out[k[over], cols[over]] = self.MAX_THIRD
+        fr = self.frame.reshape(-1, 3)
+        fr[:] = 0
+        fr[act] = out.T
         return self.frame
 
 
