@@ -44,9 +44,9 @@ max_speed = 1.5                 # Pixel pro Frame (Stabilitätsgrenze)
 # K[a, b]: wie stark Spezies a von Spezies b angezogen (+) bzw. abgestoßen (-) wird.
 # None = zufällig, sonst Liste von Listen (n_species x n_species) mit Werten -1..1.
 coupling_matrix = None
-matrix_period = 700             # alle n Frames ein neues Ziel für die Matrix
-matrix_blend = 300              # Überblenddauer zum neuen Ziel (Frames)
-matrix_change_fraction = 0.4    # Anteil der Einträge, die sich pro Wechsel ändern
+matrix_period = 100             # alle n Frames ein neues Ziel für die Matrix
+matrix_blend = 10              # Überblenddauer zum neuen Ziel (Frames)
+matrix_change_fraction = 5*0.4    # Anteil der Einträge, die sich pro Wechsel ändern
 matrix_drift = 0.002            # zusätzliches leichtes Zufallsrauschen pro Frame
 
 # ---------------------------------------------------------------- Farben
