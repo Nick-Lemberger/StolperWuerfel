@@ -595,8 +595,15 @@ def main():
     print(f"{n_particles} Pakete, Abstand {fluid.spacing:.2f} px, h = {fluid.h:.2f} px, "
           f"Palette {palette}", flush=True)
 
+    normals = {0: (1, 0, 0), 1: (0, -1, 0), 2: (-1, 0, 0), 3: (0, 1, 0), 4: (0, 0, 1), 5: (0, 0, -1)}
+    next_status = time.monotonic() + 2.0
     while True:
         accel, omega = drive.get()
+        if time.monotonic() > next_status:          # Diagnose: woher kommt die Schwerkraft, wohin zeigt sie?
+            next_status = time.monotonic() + 5.0
+            down = max(normals, key=lambda f: float(np.dot(normals[f], accel)))
+            print(f"Antrieb: {'Sensor' if drive.mode == 'Sensor' else 'DEMO (kein Sensor)'} | "
+                  f"Schwerkraft zeigt zu Fläche {down}", flush=True)
         if rotation_gain:
             fluid.rotate(omega, 1.0 / fps)
         fluid.step(accel, fps)

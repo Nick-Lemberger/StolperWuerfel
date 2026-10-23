@@ -6,8 +6,8 @@ Zwei Rollen in einer Datei:
 1) Dienst (läuft dauerhaft, z. B. als systemd-Unit cube@cubesensor):
        python3 cubesensor.py              # misst und schreibt SENSOR_FILE
        python3 cubesensor.py --show       # misst und zeigt Live-Werte (zum Einrichten)
-       python3 cubesensor.py --calibrate  # Kalibrierung: Würfel ruhig mit der Unterseite
-                                          # (Fläche 5) nach unten hinstellen
+       python3 cubesensor.py --calibrate      # Kalibrierung in zwei Lagen (geführt), Fläche 5 unten
+       python3 cubesensor.py --calibrate 2    # dito, aber Fläche 2 liegt in Schritt 1 unten
 
 2) Bibliothek für Animationsskripte (beliebig viele gleichzeitig):
        import cubesensor
@@ -19,10 +19,11 @@ Die Werte werden atomar (temporäre Datei + Umbenennen) als eine JSON-Zeile in
 
 Koordinaten: alle Vektoren im Würfelsystem der Animationen
     +x = Fläche 0, -x = Fläche 2, -y = Fläche 1, +y = Fläche 3, +z = Fläche 4, -z = Fläche 5
-Kalibrierung (--calibrate): Die Einbaulage des Sensors muss nicht bekannt sein. Die bei der
-Kalibrierung gemessene Schwerkraftrichtung wird als "Fläche 5 unten" festgelegt; die Lage der
-Seitenflächen 0–3 ergibt sich daraus beliebig, aber fest und konsistent (echte Drehung, daher
-stimmt auch der Drehsinn des Gyros). Zusätzlich wird der Gyro-Nullpunkt bestimmt.
+Kalibrierung (--calibrate): Die Einbaulage des Sensors muss nicht bekannt sein.
+  Schritt 1: die angegebene Fläche (Standard 5) liegt unten -> "unten" exakt + Gyro-Nullpunkt.
+  Schritt 2: eine Nachbarfläche liegt unten -> legt die Seiten fest (welche Seite welche
+             Fläche ist). Ohne Schritt 2 wird eine achsparallele Einbaulage angenommen.
+  Welche Nummer ein Panel hat, zeigt faceID.py.
 Gespeichert wird in cubesensor_calib.json neben diesem Skript; beim Start wird die Datei
 automatisch geladen, ein laufender Dienst übernimmt eine neue Kalibrierung ohne Neustart.
 """
@@ -234,7 +235,9 @@ def load_calibration():
     if R is None:                                   # ältere Datei: nur Gyro-Nullpunkt
         return M, bias, "Kalibrierung ohne Lagekorrektur (bitte --calibrate erneut ausführen)"
     R = [[float(x) for x in row] for row in R]
-    return R, bias, f"Kalibrierung vom {c.get('date', '?')} geladen (Fläche {c.get('down_face', 5)} = unten)"
+    kind = "vollständig" if c.get("side_face") is not None else "nur unten"
+    return R, bias, (f"Kalibrierung vom {c.get('date', '?')} geladen "
+                     f"(Fläche {c.get('down_face', 5)} = unten, {kind})")
 
 
 def _write_atomic(path, text):
@@ -248,11 +251,10 @@ def _write_atomic(path, text):
         pass
 
 
-def calibrate():
-    print(f"Kalibrierung: Würfel mit Fläche {CALIB_DOWN_FACE} nach unten ruhig hinstellen.")
-    print(f"Messe {CALIB_SECONDS:.0f} s ...", flush=True)
-    mpu = MPU6050(reset=False)                      # läuft der Dienst, wird er nicht gestört
-    time.sleep(0.1)
+def _measure(mpu):
+    """Mittelt CALIB_SECONDS lang. Rückgabe (Hochrichtung, Gyro-Mittel, |g|) oder None bei Bewegung."""
+    print(f"  messe {CALIB_SECONDS:.0f} s – Würfel nicht berühren ...", flush=True)
+    time.sleep(0.3)
     accs, gyros = [], []
     t_end = time.monotonic() + CALIB_SECONDS
     while time.monotonic() < t_end:
@@ -267,42 +269,99 @@ def calibrate():
     m_mean = sum(mags) / n
     m_std = math.sqrt(sum((m - m_mean) ** 2 for m in mags) / n)
     spread = max(_norm([a[k] - a_mean[k] for k in range(3)]) for a in accs)
-
     if m_std > CALIB_MAX_MOTION or spread > 5 * CALIB_MAX_MOTION:
-        print(f"Abbruch: Würfel hat sich bewegt (Schwankung {m_std:.3f} g, max. Abweichung {spread:.3f} g). "
-              "Ruhig hinstellen und erneut starten.")
-        return 1
+        print(f"  Abbruch: Würfel hat sich bewegt (Schwankung {m_std:.3f} g, max. Abweichung {spread:.3f} g).")
+        return None
     if not 0.85 < m_mean < 1.15:
-        print(f"Warnung: gemessene Schwerkraft {m_mean:.3f} g weicht deutlich von 1 g ab "
-              "(Messbereich/Sensor prüfen). Kalibriere trotzdem.")
-
-    # Gemessene Hochrichtung im Sensorsystem exakt auf "oben" (Gegenrichtung von CALIB_DOWN_FACE)
-    # drehen – unabhängig von der Einbaulage. Die Drehung um die Senkrechte (welche Seite
-    # Fläche 0..3 ist) lässt sich aus einer Messung nicht bestimmen; gewählt wird die Lage, in
-    # der die Sensorachsen parallel zu den Würfelkanten liegen (übliche Montage), danach wird
-    # nur noch die Restneigung korrigiert. "Unten" stimmt in jedem Fall exakt.
+        print(f"  Warnung: gemessene Schwerkraft {m_mean:.3f} g weicht deutlich von 1 g ab.")
     un = _norm(a_mean)
-    u = [x / un for x in a_mean]
-    P, k, sgn = _axis_aligned_base(u)
-    C = _align(_rot(P, u), [0.0, 0.0, 1.0])            # Restneigung
-    target = [-x for x in FACE_NORMALS[CALIB_DOWN_FACE]]
-    R = _matmul(_align([0.0, 0.0, 1.0], target), _matmul(C, P))
-    resid = math.degrees(math.acos(max(-1.0, min(1.0, abs(u[k])))))
+    return [x / un for x in a_mean], g_mean, m_mean
+
+
+def _triad(u1, u2, t1, t2):
+    """Drehung R mit R·u1 = t1 exakt und R·u2 so nah wie möglich an t2."""
+    def basis(a, b):
+        e1 = a[:]
+        d = sum(x * y for x, y in zip(b, e1))
+        e2 = [y - d * x for x, y in zip(e1, b)]
+        n2 = _norm(e2)
+        e2 = [x / n2 for x in e2]
+        e3 = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]]
+        return [e1, e2, e3]
+    S, T = basis(u1, u2), basis(t1, t2)
+    return [[sum(T[k][i] * S[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def _ask(prompt):
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
+def calibrate(down_face=CALIB_DOWN_FACE):
+    """Schritt 1 (Pflicht): down_face liegt unten -> legt "unten" exakt fest + Gyro-Nullpunkt.
+    Schritt 2 (empfohlen): eine benachbarte Seitenfläche liegt unten -> legt fest, welche Seite
+    welche Fläche ist. Erst damit fließt die Flüssigkeit beim Kippen zur richtigen Seite."""
+    interactive = sys.stdin.isatty()
+    mpu = MPU6050(reset=False)                      # läuft der Dienst, wird er nicht gestört
+    print("Kalibrierung (die Flächennummern zeigt 'python3 faceID.py' auf dem Würfel)")
+    print(f"Schritt 1: Würfel ruhig mit Fläche {down_face} nach unten hinstellen.")
+    if interactive:
+        _ask("  Enter drücken, wenn er steht ... ")
+    m1 = _measure(mpu)
+    if m1 is None:
+        return 1
+    u1, g_mean, m_mean = m1
+    t1 = [-x for x in FACE_NORMALS[down_face]]
+
+    side = None
+    if interactive:
+        sides = [f for f in FACE_NORMALS if f not in (down_face, {0: 2, 2: 0, 1: 3, 3: 1, 4: 5, 5: 4}[down_face])]
+        while True:
+            ans = _ask(f"Schritt 2: Würfel auf eine der Flächen {sides} kippen, deren Nummer eingeben "
+                       "und Enter drücken (leer = überspringen): ").strip()
+            if ans == "":
+                break
+            if ans.isdigit() and int(ans) in sides:
+                side = int(ans)
+                break
+            print(f"  Bitte eine der Flächen {sides} angeben (Nachbarflächen von {down_face}).")
+
+    if side is not None:
+        m2 = _measure(mpu)
+        if m2 is None:
+            return 1
+        u2 = m2[0]
+        ang = math.degrees(math.acos(max(-1.0, min(1.0, sum(a * b for a, b in zip(u1, u2))))))
+        if not 70 < ang < 110:
+            print(f"  Abbruch: zwischen beiden Lagen liegen {ang:.0f}° statt etwa 90° – "
+                  "lag in Schritt 2 wirklich eine Nachbarfläche flach unten?")
+            return 1
+        t2 = [-x for x in FACE_NORMALS[side]]
+        R = _triad(u1, u2, t1, t2)
+        how = f"vollständig (Fläche {down_face} und Fläche {side}, Winkel zwischen den Lagen {ang:.1f}°)"
+    else:
+        # nur "unten" bekannt: achsparallele Einbaulage annehmen, Restneigung korrigieren
+        P, k, sgn = _axis_aligned_base(u1)
+        C = _align(_rot(P, u1), [0.0, 0.0, 1.0])
+        R = _matmul(_align([0.0, 0.0, 1.0], t1), _matmul(C, P))
+        how = "nur unten (Schritt 2 übersprungen)"
 
     calib = {
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "down_face": CALIB_DOWN_FACE,
+        "down_face": down_face,
+        "side_face": side,
         "matrix": [[round(x, 6) for x in row] for row in R],
         "gyro_bias": [round(x, 4) for x in g_mean],
         "gravity_g": round(m_mean, 4),
-        "sensor_up": [round(x, 4) for x in u],
     }
     _write_atomic(CALIB_FILE, json.dumps(calib, indent=1))
-    print(f"Gespeichert in {CALIB_FILE}")
-    print(f"  Sensorachse {'+-'[sgn < 0]}{'xyz'[k]} zeigt nach oben (Restneigung {resid:.1f}° korrigiert)"
-          f" -> Fläche {CALIB_DOWN_FACE} = unten")
-    print(f"  Gyro-Nullpunkt [°/s]: {[round(x, 3) for x in g_mean]}")
-    print(f"  gemessene Schwerkraft: {m_mean:.3f} g")
+    print(f"Gespeichert in {CALIB_FILE}: {how}")
+    print(f"  Gyro-Nullpunkt [°/s]: {[round(x, 3) for x in g_mean]}, Schwerkraft {m_mean:.3f} g")
+    if side is None:
+        print("  Hinweis: Ohne Schritt 2 ist nur 'unten' sicher; beim Kippen kann die Flüssigkeit zur "
+              "falschen Seite fließen.")
     return 0
 
 
@@ -400,6 +459,10 @@ def run(show=False):
 
 if __name__ == "__main__":
     if "--calibrate" in sys.argv:
-        sys.exit(calibrate())
+        i = sys.argv.index("--calibrate")
+        arg = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        if arg and not (arg.isdigit() and int(arg) in FACE_NORMALS):
+            sys.exit(f"Ungültige Fläche '{arg}' – erlaubt sind 0..5")
+        sys.exit(calibrate(int(arg) if arg else CALIB_DOWN_FACE))
     else:
         run(show="--show" in sys.argv)
