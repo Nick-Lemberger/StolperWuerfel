@@ -6,7 +6,8 @@ Zwei Rollen in einer Datei:
 1) Dienst (läuft dauerhaft, z. B. als systemd-Unit cube@cubesensor):
        python3 cubesensor.py              # misst und schreibt SENSOR_FILE
        python3 cubesensor.py --show       # misst und zeigt Live-Werte (zum Einrichten)
-       python3 cubesensor.py --calibrate  # Gyro-Nullpunkt bestimmen (Würfel ruhig stellen)
+       python3 cubesensor.py --calibrate  # Kalibrierung: Würfel ruhig mit der Unterseite
+                                          # (Fläche 5) nach unten hinstellen
 
 2) Bibliothek für Animationsskripte (beliebig viele gleichzeitig):
        import cubesensor
@@ -18,7 +19,12 @@ Die Werte werden atomar (temporäre Datei + Umbenennen) als eine JSON-Zeile in
 
 Koordinaten: alle Vektoren im Würfelsystem der Animationen
     +x = Fläche 0, -x = Fläche 2, -y = Fläche 1, +y = Fläche 3, +z = Fläche 4, -z = Fläche 5
-Die Einbaulage des Sensors legt AXIS_MAP fest (mit --show schnell ermittelbar).
+Kalibrierung (--calibrate): Die Einbaulage des Sensors muss nicht bekannt sein. Die bei der
+Kalibrierung gemessene Schwerkraftrichtung wird als "Fläche 5 unten" festgelegt; die Lage der
+Seitenflächen 0–3 ergibt sich daraus beliebig, aber fest und konsistent (echte Drehung, daher
+stimmt auch der Drehsinn des Gyros). Zusätzlich wird der Gyro-Nullpunkt bestimmt.
+Gespeichert wird in cubesensor_calib.json neben diesem Skript; beim Start wird die Datei
+automatisch geladen, ein laufender Dienst übernimmt eine neue Kalibrierung ohne Neustart.
 """
 import json
 import math
@@ -39,11 +45,14 @@ DLPF = 3                        # interner Tiefpass: 0=260 Hz, 1=184, 2=94, 3=44
 GRAVITY_TAU = 0.4               # s, Zeitkonstante der Schwerkraftschätzung (Tiefpass)
 SHAKE_TAU = 0.15                # s, Glättung des Schüttel-Werts
 
-# Einbaulage: welche Würfelachse entspricht der Sensor-Achse x, y, z?
-# Beispiel ("+y", "-x", "+z"): Sensor-x zeigt zur Würfel-+y-Richtung usw.
+# Einbaulage – wird nur verwendet, solange keine Kalibrierung vorhanden ist.
+# Welche Würfelachse entspricht der Sensor-Achse x, y, z? z. B. ("+y", "-x", "+z")
 AXIS_MAP = ("+x", "+y", "+z")
 
 CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cubesensor_calib.json")
+CALIB_DOWN_FACE = 5             # Fläche, die bei der Kalibrierung nach unten zeigt
+CALIB_SECONDS = 3.0             # Messdauer der Kalibrierung
+CALIB_MAX_MOTION = 0.02         # g; stärkere Schwankung -> Würfel bewegt, Abbruch
 STALE_AFTER = 0.5               # s; ältere Daten liefert read() als None
 
 # ====================================================================== Würfelgeometrie
@@ -81,6 +90,48 @@ def _rot(M, v):
 
 def _norm(v):
     return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+
+def _matmul(A, B):
+    return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def _align(u, t):
+    """Kleinste Drehung (3x3), die den Einheitsvektor u auf t dreht (Rodrigues)."""
+    c = sum(a * b for a, b in zip(u, t))
+    v = [u[1] * t[2] - u[2] * t[1], u[2] * t[0] - u[0] * t[2], u[0] * t[1] - u[1] * t[0]]
+    s = _norm(v)
+    if s < 1e-9:
+        if c > 0:
+            return [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        # entgegengesetzt: 180° um eine zu u senkrechte Achse
+        a = [1, 0, 0] if abs(u[0]) < 0.9 else [0, 1, 0]
+        k = [u[1] * a[2] - u[2] * a[1], u[2] * a[0] - u[0] * a[2], u[0] * a[1] - u[1] * a[0]]
+        kn = _norm(k)
+        k = [x / kn for x in k]
+        return [[2 * k[i] * k[j] - (1 if i == j else 0) for j in range(3)] for i in range(3)]
+    k = [x / s for x in v]
+    K = [[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]]
+    K2 = _matmul(K, K)
+    return [[(1 if i == j else 0) + s * K[i][j] + (1 - c) * K2[i][j] for j in range(3)] for i in range(3)]
+
+
+def _axis_aligned_base(u):
+    """Achsparallele Drehung P (vorzeichenbehaftete Permutation, det = +1), die die
+    Sensorachse, die am stärksten nach oben zeigt, auf Würfel-+z legt."""
+    k = max(range(3), key=lambda i: abs(u[i]))
+    s = 1 if u[k] > 0 else -1
+    a, b = (k + 1) % 3, (k + 2) % 3
+    P = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    P[0][a] = 1
+    P[1][b] = 1
+    P[2][k] = s
+    det = (P[0][0] * (P[1][1] * P[2][2] - P[1][2] * P[2][1])
+           - P[0][1] * (P[1][0] * P[2][2] - P[1][2] * P[2][0])
+           + P[0][2] * (P[1][0] * P[2][1] - P[1][1] * P[2][0]))
+    if det < 0:
+        P[1][b] = -1
+    return P, k, s
 
 
 def up_face_of(up):
@@ -129,7 +180,7 @@ class MPU6050:
     PWR_MGMT_1, SMPLRT_DIV, CONFIG = 0x6B, 0x19, 0x1A
     GYRO_CONFIG, ACCEL_CONFIG, ACCEL_XOUT_H, WHO_AM_I = 0x1B, 0x1C, 0x3B, 0x75
 
-    def __init__(self, bus_no=I2C_BUS, addr=I2C_ADDR):
+    def __init__(self, bus_no=I2C_BUS, addr=I2C_ADDR, reset=True):
         try:
             from smbus2 import SMBus
         except ImportError:
@@ -138,15 +189,16 @@ class MPU6050:
         self.addr = addr
         self.acc_scale = 16384.0 / (ACCEL_RANGE_G / 2)
         self.gyro_scale = 131.0 / (GYRO_RANGE_DPS / 250)
-        self.init()
+        self.init(reset)
 
-    def init(self):
+    def init(self, reset=True):
         who = self.bus.read_byte_data(self.addr, self.WHO_AM_I)
         if who != 0x68:
             print(f"Hinweis: WHO_AM_I = 0x{who:02x} (erwartet 0x68) – evtl. Klon, mache weiter.")
         w = self.bus.write_byte_data
-        w(self.addr, self.PWR_MGMT_1, 0x80)                 # Reset
-        time.sleep(0.1)
+        if reset:                                           # (nicht bei laufendem Dienst)
+            w(self.addr, self.PWR_MGMT_1, 0x80)             # Reset
+            time.sleep(0.1)
         w(self.addr, self.PWR_MGMT_1, 0x01)                 # aufwecken, Takt = Gyro-PLL
         time.sleep(0.05)
         w(self.addr, self.CONFIG, DLPF & 0x07)
@@ -166,12 +218,23 @@ class MPU6050:
 
 
 # ====================================================================== Dienst
-def _load_calib():
+def load_calibration():
+    """Liefert (Matrix Sensor -> Würfel, Gyro-Nullpunkt im Sensorsystem, Info-Text).
+    Ohne gültige Kalibrierung: AXIS_MAP und Nullpunkt 0."""
+    M = _axis_matrix(AXIS_MAP)
     try:
         with open(CALIB_FILE) as fh:
-            return json.load(fh).get("gyro_bias", [0.0, 0.0, 0.0])
-    except (OSError, ValueError):
-        return [0.0, 0.0, 0.0]
+            c = json.load(fh)
+    except FileNotFoundError:
+        return M, [0.0, 0.0, 0.0], "keine Kalibrierung gefunden – AXIS_MAP wird verwendet"
+    except (OSError, ValueError) as e:
+        return M, [0.0, 0.0, 0.0], f"Kalibrierdatei unlesbar ({e}) – AXIS_MAP wird verwendet"
+    bias = [float(x) for x in c.get("gyro_bias", [0.0, 0.0, 0.0])]
+    R = c.get("matrix")
+    if R is None:                                   # ältere Datei: nur Gyro-Nullpunkt
+        return M, bias, "Kalibrierung ohne Lagekorrektur (bitte --calibrate erneut ausführen)"
+    R = [[float(x) for x in row] for row in R]
+    return R, bias, f"Kalibrierung vom {c.get('date', '?')} geladen (Fläche {c.get('down_face', 5)} = unten)"
 
 
 def _write_atomic(path, text):
@@ -185,25 +248,76 @@ def _write_atomic(path, text):
         pass
 
 
-def calibrate(seconds=3.0):
-    print(f"Würfel ruhig stellen – messe {seconds:.0f} s ...")
-    mpu = MPU6050()
-    n, s = 0, [0.0, 0.0, 0.0]
-    t_end = time.time() + seconds
-    while time.time() < t_end:
-        _, g, _ = mpu.read_raw()
-        s = [a + b for a, b in zip(s, g)]
-        n += 1
+def calibrate():
+    print(f"Kalibrierung: Würfel mit Fläche {CALIB_DOWN_FACE} nach unten ruhig hinstellen.")
+    print(f"Messe {CALIB_SECONDS:.0f} s ...", flush=True)
+    mpu = MPU6050(reset=False)                      # läuft der Dienst, wird er nicht gestört
+    time.sleep(0.1)
+    accs, gyros = [], []
+    t_end = time.monotonic() + CALIB_SECONDS
+    while time.monotonic() < t_end:
+        a, g, _ = mpu.read_raw()
+        accs.append(a)
+        gyros.append(g)
         time.sleep(1.0 / POLL_HZ)
-    bias = [x / n for x in s]
-    with open(CALIB_FILE, "w") as fh:
-        json.dump({"gyro_bias": bias}, fh)
-    print("Gyro-Nullpunkt [°/s]:", [round(b, 3) for b in bias], "->", CALIB_FILE)
+    n = len(accs)
+    a_mean = [sum(a[k] for a in accs) / n for k in range(3)]
+    g_mean = [sum(g[k] for g in gyros) / n for k in range(3)]
+    mags = [_norm(a) for a in accs]
+    m_mean = sum(mags) / n
+    m_std = math.sqrt(sum((m - m_mean) ** 2 for m in mags) / n)
+    spread = max(_norm([a[k] - a_mean[k] for k in range(3)]) for a in accs)
+
+    if m_std > CALIB_MAX_MOTION or spread > 5 * CALIB_MAX_MOTION:
+        print(f"Abbruch: Würfel hat sich bewegt (Schwankung {m_std:.3f} g, max. Abweichung {spread:.3f} g). "
+              "Ruhig hinstellen und erneut starten.")
+        return 1
+    if not 0.85 < m_mean < 1.15:
+        print(f"Warnung: gemessene Schwerkraft {m_mean:.3f} g weicht deutlich von 1 g ab "
+              "(Messbereich/Sensor prüfen). Kalibriere trotzdem.")
+
+    # Gemessene Hochrichtung im Sensorsystem exakt auf "oben" (Gegenrichtung von CALIB_DOWN_FACE)
+    # drehen – unabhängig von der Einbaulage. Die Drehung um die Senkrechte (welche Seite
+    # Fläche 0..3 ist) lässt sich aus einer Messung nicht bestimmen; gewählt wird die Lage, in
+    # der die Sensorachsen parallel zu den Würfelkanten liegen (übliche Montage), danach wird
+    # nur noch die Restneigung korrigiert. "Unten" stimmt in jedem Fall exakt.
+    un = _norm(a_mean)
+    u = [x / un for x in a_mean]
+    P, k, sgn = _axis_aligned_base(u)
+    C = _align(_rot(P, u), [0.0, 0.0, 1.0])            # Restneigung
+    target = [-x for x in FACE_NORMALS[CALIB_DOWN_FACE]]
+    R = _matmul(_align([0.0, 0.0, 1.0], target), _matmul(C, P))
+    resid = math.degrees(math.acos(max(-1.0, min(1.0, abs(u[k])))))
+
+    calib = {
+        "date": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "down_face": CALIB_DOWN_FACE,
+        "matrix": [[round(x, 6) for x in row] for row in R],
+        "gyro_bias": [round(x, 4) for x in g_mean],
+        "gravity_g": round(m_mean, 4),
+        "sensor_up": [round(x, 4) for x in u],
+    }
+    _write_atomic(CALIB_FILE, json.dumps(calib, indent=1))
+    print(f"Gespeichert in {CALIB_FILE}")
+    print(f"  Sensorachse {'+-'[sgn < 0]}{'xyz'[k]} zeigt nach oben (Restneigung {resid:.1f}° korrigiert)"
+          f" -> Fläche {CALIB_DOWN_FACE} = unten")
+    print(f"  Gyro-Nullpunkt [°/s]: {[round(x, 3) for x in g_mean]}")
+    print(f"  gemessene Schwerkraft: {m_mean:.3f} g")
+    return 0
+
+
+def _calib_mtime():
+    try:
+        return os.stat(CALIB_FILE).st_mtime
+    except OSError:
+        return None
 
 
 def run(show=False):
-    M = _axis_matrix(AXIS_MAP)
-    bias = _load_calib()
+    M, bias, info = load_calibration()
+    print(info, flush=True)
+    calib_mtime = _calib_mtime()
+    next_calib_check = time.monotonic() + 1.0
     dt = 1.0 / POLL_HZ
     a_g = math.exp(-dt / GRAVITY_TAU)
     a_s = math.exp(-dt / SHAKE_TAU)
@@ -230,6 +344,16 @@ def run(show=False):
             mpu = None
             time.sleep(min(1.0, 0.05 * errors))
             continue
+
+        # neue Kalibrierung übernehmen, ohne den Dienst neu zu starten
+        if time.monotonic() > next_calib_check:
+            next_calib_check = time.monotonic() + 1.0
+            mt = _calib_mtime()
+            if mt != calib_mtime:
+                calib_mtime = mt
+                M, bias, info = load_calibration()
+                grav = None
+                print(info, flush=True)
 
         acc = _rot(M, acc_s)
         gyro = _rot(M, [g - b for g, b in zip(gyro_s, bias)])
@@ -276,6 +400,6 @@ def run(show=False):
 
 if __name__ == "__main__":
     if "--calibrate" in sys.argv:
-        calibrate()
+        sys.exit(calibrate())
     else:
         run(show="--show" in sys.argv)
